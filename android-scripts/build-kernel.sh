@@ -19,7 +19,7 @@ make ARCH=arm CROSS_COMPILE=arm-none-eabi- modules
 if [ -e ../initramfs/ ]; then
 	rm -rf $TMP_INITRAMFS $TMP_INITRAMFS.cpio
 
-	cp -af ../initramfs/ $TMP_INITRAMFS
+	rsync -avHS --exclude=.gitignore --exclude=.git ../initramfs/ $TMP_INITRAMFS
 	find -name '*.ko' -exec cp -av {} $TMP_INITRAMFS/lib/modules/ \;
 
 	cd $TMP_INITRAMFS
