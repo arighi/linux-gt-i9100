@@ -194,10 +194,28 @@ static inline int rt_bandwidth_enabled(void)
 	return sysctl_sched_rt_runtime >= 0;
 }
 
+static void start_bandwidth_timer(struct hrtimer *period_timer, ktime_t period)
+{
+	unsigned long delta;
+	ktime_t soft, hard, now;
+
+	for (;;) {
+		if (hrtimer_active(period_timer))
+			break;
+
+		now = hrtimer_cb_get_time(period_timer);
+		hrtimer_forward(period_timer, now, period);
+
+		soft = hrtimer_get_softexpires(period_timer);
+		hard = hrtimer_get_expires(period_timer);
+		delta = ktime_to_ns(ktime_sub(hard, soft));
+		__hrtimer_start_range_ns(period_timer, soft, delta, 
+					 HRTIMER_MODE_ABS_PINNED, 0);
+	}
+}
+
 static void start_rt_bandwidth(struct rt_bandwidth *rt_b)
 {
-	ktime_t now;
-
 	if (!rt_bandwidth_enabled() || rt_b->rt_runtime == RUNTIME_INF)
 		return;
 
@@ -205,22 +223,7 @@ static void start_rt_bandwidth(struct rt_bandwidth *rt_b)
 		return;
 
 	raw_spin_lock(&rt_b->rt_runtime_lock);
-	for (;;) {
-		unsigned long delta;
-		ktime_t soft, hard;
-
-		if (hrtimer_active(&rt_b->rt_period_timer))
-			break;
-
-		now = hrtimer_cb_get_time(&rt_b->rt_period_timer);
-		hrtimer_forward(&rt_b->rt_period_timer, now, rt_b->rt_period);
-
-		soft = hrtimer_get_softexpires(&rt_b->rt_period_timer);
-		hard = hrtimer_get_expires(&rt_b->rt_period_timer);
-		delta = ktime_to_ns(ktime_sub(hard, soft));
-		__hrtimer_start_range_ns(&rt_b->rt_period_timer, soft, delta,
-				HRTIMER_MODE_ABS_PINNED, 0);
-	}
+	start_bandwidth_timer(&rt_b->rt_period_timer, rt_b->rt_period);
 	raw_spin_unlock(&rt_b->rt_runtime_lock);
 }
 
@@ -244,6 +247,15 @@ static DEFINE_MUTEX(sched_domains_mutex);
 struct cfs_rq;
 
 static LIST_HEAD(task_groups);
+
+#ifdef CONFIG_CFS_BANDWIDTH
+struct cfs_bandwidth {
+	raw_spinlock_t		lock;
+	ktime_t			period;
+	u64			runtime, quota;
+	struct hrtimer		period_timer;
+};
+#endif
 
 /* task group related information */
 struct task_group {
@@ -270,6 +282,10 @@ struct task_group {
 	struct task_group *parent;
 	struct list_head siblings;
 	struct list_head children;
+
+#ifdef CONFIG_CFS_BANDWIDTH
+	struct cfs_bandwidth cfs_bandwidth;
+#endif
 };
 
 #define root_task_group init_task_group
@@ -371,8 +387,76 @@ struct cfs_rq {
 	 */
 	unsigned long rq_weight;
 #endif
+#ifdef CONFIG_CFS_BANDWIDTH
+	u64 quota_assigned, quota_used;
+	int throttled;
+#endif
 #endif
 };
+
+#ifdef CONFIG_CFS_BANDWIDTH
+static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun);
+
+static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
+{
+	struct cfs_bandwidth *cfs_b =
+		container_of(timer, struct cfs_bandwidth, period_timer);
+	ktime_t now;
+	int overrun;
+	int idle = 0;
+
+	for (;;) {
+		now = hrtimer_cb_get_time(timer);
+		overrun = hrtimer_forward(timer, now, cfs_b->period);
+
+		if (!overrun)
+			break;
+
+		idle = do_sched_cfs_period_timer(cfs_b, overrun);
+	}
+
+	return idle ? HRTIMER_NORESTART : HRTIMER_RESTART;
+}
+
+static
+void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b, u64 quota, u64 period)
+{
+	raw_spin_lock_init(&cfs_b->lock);
+	cfs_b->quota = cfs_b->runtime = quota;
+	cfs_b->period = ns_to_ktime(period);
+
+	hrtimer_init(&cfs_b->period_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	cfs_b->period_timer.function = sched_cfs_period_timer;
+}
+
+static
+void init_cfs_rq_quota(struct cfs_rq *cfs_rq)
+{
+	cfs_rq->quota_used = 0;
+	if (cfs_rq->tg->cfs_bandwidth.quota == RUNTIME_INF)
+		cfs_rq->quota_assigned = RUNTIME_INF;
+	else
+		cfs_rq->quota_assigned = 0;
+}
+
+static void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+{
+	if (cfs_b->quota == RUNTIME_INF)
+		return;
+
+	if (hrtimer_active(&cfs_b->period_timer))
+		return;
+
+	raw_spin_lock(&cfs_b->lock);
+	start_bandwidth_timer(&cfs_b->period_timer, cfs_b->period);
+	raw_spin_unlock(&cfs_b->lock);
+}
+
+static void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+{
+	hrtimer_cancel(&cfs_b->period_timer);
+}
+#endif
 
 /* Real-Time classes' related field in a runqueue: */
 struct rt_rq {
@@ -1479,6 +1563,8 @@ static int tg_nop(struct task_group *tg, void *data)
 }
 #endif
 
+static inline const struct cpumask *sched_bw_period_mask(void);
+
 #ifdef CONFIG_SMP
 /* Used instead of source_load when we know the type == 0 */
 static unsigned long weighted_cpuload(const int cpu)
@@ -1583,6 +1669,8 @@ static void update_group_shares_cpu(struct task_group *tg, int cpu,
 	}
 }
 
+static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq);
+
 /*
  * Re-compute the task group their per cpu shares over the given domain.
  * This needs to be done in a bottom-up fashion because the rq weight of a
@@ -1603,7 +1691,14 @@ static int tg_shares_up(struct task_group *tg, void *data)
 	usd_rq_weight = per_cpu_ptr(update_shares_data, smp_processor_id());
 
 	for_each_cpu(i, sched_domain_span(sd)) {
-		weight = tg->cfs_rq[i]->load.weight;
+		/*
+		 * bandwidth throttled entities cannot contribute to load
+		 * balance
+		 */
+		if (!cfs_rq_throttled(tg->cfs_rq[i]))
+			weight = tg->cfs_rq[i]->load.weight;
+		else
+			weight = 0;
 		usd_rq_weight[i] = weight;
 
 		rq_weight += weight;
@@ -1908,6 +2003,38 @@ static void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
 	dequeue_task(rq, p, flags);
 	dec_nr_running(rq);
 }
+
+#ifdef CONFIG_SMP
+static inline const struct cpumask *sched_bw_period_mask(void)
+{
+	return cpu_rq(smp_processor_id())->rd->span;
+}
+#else
+static inline const struct cpumask *sched_bw_period_mask(void)
+{
+	return cpu_online_mask;
+}
+#endif
+
+#ifdef CONFIG_CFS_BANDWIDTH
+/*
+ * default period for cfs group bandwidth.
+ * default: 0.5s
+ */
+static u64 sched_cfs_bandwidth_period = 500000000ULL;
+
+/*
+ * default slice of quota to allocate from global tg to local cfs_rq pool on
+ * each refresh
+ * default: 10ms
+ */
+unsigned int sysctl_sched_cfs_bandwidth_slice = 10000UL;
+
+static inline u64 sched_cfs_bandwidth_slice(void)
+{
+	return (u64)sysctl_sched_cfs_bandwidth_slice * NSEC_PER_USEC;
+}
+#endif /* CONFIG_CFS_BANDWIDTH */
 
 #include "sched_idletask.c"
 #include "sched_fair.c"
@@ -7582,6 +7709,9 @@ static void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
 	tg->cfs_rq[cpu] = cfs_rq;
 	init_cfs_rq(cfs_rq, rq);
 	cfs_rq->tg = tg;
+#ifdef CONFIG_CFS_BANDWIDTH
+	init_cfs_rq_quota(cfs_rq);
+#endif
 	if (add)
 		list_add(&cfs_rq->leaf_cfs_rq_list, &rq->leaf_cfs_rq_list);
 
@@ -7730,6 +7860,10 @@ void __init sched_init(void)
 		 * We achieve this by letting init_task_group's tasks sit
 		 * directly in rq->cfs (i.e init_task_group->se[] = NULL).
 		 */
+#ifdef CONFIG_CFS_BANDWIDTH
+		init_cfs_bandwidth(&init_task_group.cfs_bandwidth,
+				RUNTIME_INF, sched_cfs_bandwidth_period);
+#endif
 		init_tg_cfs_entry(&init_task_group, &rq->cfs, NULL, i, 1, NULL);
 #endif
 #endif /* CONFIG_FAIR_GROUP_SCHED */
@@ -7984,6 +8118,10 @@ static void free_fair_sched_group(struct task_group *tg)
 {
 	int i;
 
+#ifdef CONFIG_CFS_BANDWIDTH
+	destroy_cfs_bandwidth(&tg->cfs_bandwidth);
+#endif
+
 	for_each_possible_cpu(i) {
 		if (tg->cfs_rq)
 			kfree(tg->cfs_rq[i]);
@@ -8011,7 +8149,10 @@ int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent)
 		goto err;
 
 	tg->shares = NICE_0_LOAD;
-
+#ifdef CONFIG_CFS_BANDWIDTH
+	init_cfs_bandwidth(&tg->cfs_bandwidth, RUNTIME_INF,
+			sched_cfs_bandwidth_period);
+#endif
 	for_each_possible_cpu(i) {
 		rq = cpu_rq(i);
 
@@ -8457,7 +8598,7 @@ static int __rt_schedulable(struct task_group *tg, u64 period, u64 runtime)
 	return walk_tg_tree(tg_schedulable, tg_nop, &data);
 }
 
-static int tg_set_bandwidth(struct task_group *tg,
+static int tg_set_rt_bandwidth(struct task_group *tg,
 		u64 rt_period, u64 rt_runtime)
 {
 	int i, err = 0;
@@ -8496,7 +8637,7 @@ int sched_group_set_rt_runtime(struct task_group *tg, long rt_runtime_us)
 	if (rt_runtime_us < 0)
 		rt_runtime = RUNTIME_INF;
 
-	return tg_set_bandwidth(tg, rt_period, rt_runtime);
+	return tg_set_rt_bandwidth(tg, rt_period, rt_runtime);
 }
 
 long sched_group_rt_runtime(struct task_group *tg)
@@ -8521,7 +8662,7 @@ int sched_group_set_rt_period(struct task_group *tg, long rt_period_us)
 	if (rt_period == 0)
 		return -EINVAL;
 
-	return tg_set_bandwidth(tg, rt_period, rt_runtime);
+	return tg_set_rt_bandwidth(tg, rt_period, rt_runtime);
 }
 
 long sched_group_rt_period(struct task_group *tg)
@@ -8737,6 +8878,123 @@ static u64 cpu_shares_read_u64(struct cgroup *cgrp, struct cftype *cft)
 
 	return (u64) tg->shares;
 }
+
+#ifdef CONFIG_CFS_BANDWIDTH
+static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
+{
+	int i;
+	static DEFINE_MUTEX(mutex);
+
+	if (tg == &init_task_group)
+		return -EINVAL;
+
+	if (!period)
+		return -EINVAL;
+
+	mutex_lock(&mutex);
+	/*
+	 * Ensure we have at least one tick of bandwidth every period.  This is
+	 * to prevent reaching a state of large arrears when throttled via
+	 * entity_tick() resulting in prolonged exit starvation.
+	 */
+	if (NS_TO_JIFFIES(quota) < 1)
+		return -EINVAL;
+
+	raw_spin_lock_irq(&tg->cfs_bandwidth.lock);
+	tg->cfs_bandwidth.period = ns_to_ktime(period);
+	tg->cfs_bandwidth.runtime = tg->cfs_bandwidth.quota = quota;
+	raw_spin_unlock_irq(&tg->cfs_bandwidth.lock);
+
+	for_each_possible_cpu(i) {
+		struct cfs_rq *cfs_rq = tg->cfs_rq[i];
+		struct rq *rq = rq_of(cfs_rq);
+
+		raw_spin_lock_irq(&rq->lock);
+		cfs_rq->quota_used = 0;
+		if (quota == RUNTIME_INF)
+			cfs_rq->quota_assigned = RUNTIME_INF;
+		else
+			cfs_rq->quota_assigned = 0;
+
+		if (cfs_rq_throttled(cfs_rq))
+			unthrottle_cfs_rq(cfs_rq);
+		raw_spin_unlock_irq(&rq->lock);
+	}
+	mutex_unlock(&mutex);
+
+	return 0;
+}
+
+int tg_set_cfs_quota(struct task_group *tg, long cfs_runtime_us)
+{
+	u64 quota, period;
+
+	period = ktime_to_ns(tg->cfs_bandwidth.period);
+	if (cfs_runtime_us < 0)
+		quota = RUNTIME_INF;
+	else
+		quota = (u64)cfs_runtime_us * NSEC_PER_USEC;
+
+	return tg_set_cfs_bandwidth(tg, period, quota);
+}
+
+long tg_get_cfs_quota(struct task_group *tg)
+{
+	u64 quota_us;
+
+	if (tg->cfs_bandwidth.quota == RUNTIME_INF)
+		return -1;
+
+	quota_us = tg->cfs_bandwidth.quota;
+	do_div(quota_us, NSEC_PER_USEC);
+	return quota_us;
+}
+
+int tg_set_cfs_period(struct task_group *tg, long cfs_period_us)
+{
+	u64 quota, period;
+
+	period = (u64)cfs_period_us * NSEC_PER_USEC;
+	quota = tg->cfs_bandwidth.quota;
+
+	if (period <= 0)
+		return -EINVAL;
+
+	return tg_set_cfs_bandwidth(tg, period, quota);
+}
+
+long tg_get_cfs_period(struct task_group *tg)
+{
+	u64 cfs_period_us;
+
+	cfs_period_us = ktime_to_ns(tg->cfs_bandwidth.period);
+	do_div(cfs_period_us, NSEC_PER_USEC);
+	return cfs_period_us;
+}
+
+static s64 cpu_cfs_quota_read_s64(struct cgroup *cgrp, struct cftype *cft)
+{
+	return tg_get_cfs_quota(cgroup_tg(cgrp));
+}
+
+static int cpu_cfs_quota_write_s64(struct cgroup *cgrp, struct cftype *cftype,
+				s64 cfs_quota_us)
+{
+	return tg_set_cfs_quota(cgroup_tg(cgrp), cfs_quota_us);
+}
+
+static u64 cpu_cfs_period_read_u64(struct cgroup *cgrp, struct cftype *cft)
+{
+	return tg_get_cfs_period(cgroup_tg(cgrp));
+}
+
+static int cpu_cfs_period_write_u64(struct cgroup *cgrp, struct cftype *cftype,
+				u64 cfs_period_us)
+{
+	return tg_set_cfs_period(cgroup_tg(cgrp), cfs_period_us);
+}
+
+#endif /* CONFIG_CFS_BANDWIDTH */
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 
 #ifdef CONFIG_RT_GROUP_SCHED
@@ -8769,6 +9027,18 @@ static struct cftype cpu_files[] = {
 		.name = "shares",
 		.read_u64 = cpu_shares_read_u64,
 		.write_u64 = cpu_shares_write_u64,
+	},
+#endif
+#ifdef CONFIG_CFS_BANDWIDTH
+	{
+		.name = "cfs_quota_us",
+		.read_s64 = cpu_cfs_quota_read_s64,
+		.write_s64 = cpu_cfs_quota_write_s64,
+	},
+	{
+		.name = "cfs_period_us",
+		.read_u64 = cpu_cfs_period_read_u64,
+		.write_u64 = cpu_cfs_period_write_u64,
 	},
 #endif
 #ifdef CONFIG_RT_GROUP_SCHED

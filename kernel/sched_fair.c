@@ -264,9 +264,37 @@ static inline void
 find_matching_se(struct sched_entity **se, struct sched_entity **pse)
 {
 }
-
 #endif	/* CONFIG_FAIR_GROUP_SCHED */
 
+#ifdef CONFIG_CFS_BANDWIDTH
+static inline
+struct cfs_rq *cfs_bandwidth_cfs_rq(struct cfs_bandwidth *cfs_b, int cpu)
+{
+	return container_of(cfs_b, struct task_group,
+			cfs_bandwidth)->cfs_rq[cpu];
+}
+
+static inline struct cfs_bandwidth *tg_cfs_bandwidth(struct task_group *tg)
+{
+	return &tg->cfs_bandwidth;
+}
+
+static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq)
+{
+	return cfs_rq->throttled;
+}
+
+static void account_cfs_rq_quota(struct cfs_rq *cfs_rq,
+		unsigned long delta_exec);
+
+#else
+
+static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq)
+{
+	return 0;
+}
+
+#endif
 
 /**************************************************************
  * Scheduling class tree data structure manipulation methods:
@@ -360,6 +388,9 @@ static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 
 	rb_link_node(&se->run_node, parent, link);
 	rb_insert_color(&se->run_node, &cfs_rq->tasks_timeline);
+#ifdef CONFIG_CFS_BANDWIDTH
+	start_cfs_bandwidth(&cfs_rq->tg->cfs_bandwidth);
+#endif
 }
 
 static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
@@ -544,6 +575,9 @@ static void update_curr(struct cfs_rq *cfs_rq)
 		cpuacct_charge(curtask, delta_exec);
 		account_group_exec_runtime(curtask, delta_exec);
 	}
+#ifdef CONFIG_CFS_BANDWIDTH
+	account_cfs_rq_quota(cfs_rq, delta_exec);
+#endif
 }
 
 static inline void
@@ -764,19 +798,25 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 * Update the normalized vruntime before updating min_vruntime
 	 * through callig update_curr().
 	 */
-	if (!(flags & ENQUEUE_WAKEUP) || (flags & ENQUEUE_WAKING))
+	if (!(flags & ENQUEUE_WAKEUP | ENQUEUE_UNTHROTTLE) ||
+			(flags & ENQUEUE_WAKING))
 		se->vruntime += cfs_rq->min_vruntime;
 
 	/*
 	 * Update run-time statistics of the 'current'.
 	 */
 	update_curr(cfs_rq);
+
+	if (!entity_is_task(se) && (cfs_rq_throttled(group_cfs_rq(se)) ||
+			!group_cfs_rq(se)->nr_running))
+		return;
+
 	account_entity_enqueue(cfs_rq, se);
 
-	if (flags & ENQUEUE_WAKEUP) {
+	if (flags & (ENQUEUE_WAKEUP | ENQUEUE_UNTHROTTLE))
 		place_entity(cfs_rq, se, 0);
+	if (flags & ENQUEUE_WAKEUP)
 		enqueue_sleeper(cfs_rq, se);
-	}
 
 	update_stats_enqueue(cfs_rq, se);
 	check_spread(cfs_rq, se);
@@ -806,6 +846,11 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	 * Update run-time statistics of the 'current'.
 	 */
 	update_curr(cfs_rq);
+
+	BUG_ON(!entity_is_task(se) && cfs_rq_throttled(group_cfs_rq(se)) &&
+			se->on_rq);
+	if (!entity_is_task(se) && cfs_rq_throttled(group_cfs_rq(se)))
+		return;
 
 	update_stats_dequeue(cfs_rq, se);
 	if (flags & DEQUEUE_SLEEP) {
@@ -1052,6 +1097,9 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 			break;
 		cfs_rq = cfs_rq_of(se);
 		enqueue_entity(cfs_rq, se, flags);
+		/* don't continue to enqueue if our parent is throttled */
+		if (cfs_rq_throttled(cfs_rq))
+			break;
 		flags = ENQUEUE_WAKEUP;
 	}
 
@@ -1071,8 +1119,11 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 		dequeue_entity(cfs_rq, se, flags);
-		/* Don't dequeue parent if it has other entities besides us */
-		if (cfs_rq->load.weight)
+		/*
+		 * Don't dequeue parent if it has other entities besides us,
+		 * or if it is throttled
+		 */
+		if (cfs_rq->load.weight || cfs_rq_throttled(cfs_rq))
 			break;
 		flags |= DEQUEUE_SLEEP;
 	}
@@ -1126,6 +1177,133 @@ static void yield_task_fair(struct rq *rq)
 	se->vruntime = rightmost->vruntime + 1;
 }
 
+#ifdef CONFIG_CFS_BANDWIDTH
+static u64 tg_request_cfs_quota(struct task_group *tg)
+{
+	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(tg);
+	u64 delta = 0;
+
+	if (cfs_b->runtime > 0 || cfs_b->quota == RUNTIME_INF) {
+		raw_spin_lock(&cfs_b->lock);
+		/*
+		 * it's possible a bandwidth update has changed the global
+		 * pool.
+		 */
+		if (cfs_b->quota == RUNTIME_INF)
+			delta = sched_cfs_bandwidth_slice();
+		else {
+			delta = min(cfs_b->runtime, 
+					sched_cfs_bandwidth_slice());
+			cfs_b->runtime -= delta;
+		}
+		raw_spin_unlock(&cfs_b->lock);
+	}
+	return delta;
+}
+
+static void throttle_cfs_rq(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *se;
+	int sleep = 0;
+
+	se = cfs_rq->tg->se[cfs_rq->rq->cpu];
+
+	for_each_sched_entity(se) {
+		struct cfs_rq *cfs_rq = cfs_rq_of(se);
+
+		BUG_ON(!se->on_rq);
+		dequeue_entity(cfs_rq, se, sleep);
+
+		if (cfs_rq->load.weight || cfs_rq_throttled(cfs_rq))
+			break;
+
+		sleep = 1;
+	}
+	cfs_rq->throttled = 1;
+}
+
+static void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *se;
+	int flags = ENQUEUE_UNTHROTTLE;
+
+	se = cfs_rq->tg->se[cfs_rq->rq->cpu];
+
+	cfs_rq->throttled = 0;
+	for_each_sched_entity(se) {
+		if (se->on_rq)
+			break;
+
+		cfs_rq = cfs_rq_of(se);
+		enqueue_entity(cfs_rq, se, flags);
+		if (cfs_rq_throttled(cfs_rq))
+			break;
+		flags = ENQUEUE_WAKEUP;
+	}
+}
+
+static void account_cfs_rq_quota(struct cfs_rq *cfs_rq,
+		unsigned long delta_exec)
+{
+	if (cfs_rq->quota_assigned == RUNTIME_INF)
+		return;
+
+	cfs_rq->quota_used += delta_exec;
+
+	if (cfs_rq_throttled(cfs_rq) ||
+		cfs_rq->quota_used < cfs_rq->quota_assigned)
+		return;
+
+	cfs_rq->quota_assigned += tg_request_cfs_quota(cfs_rq->tg);
+
+	if (cfs_rq->quota_used >= cfs_rq->quota_assigned) {
+		throttle_cfs_rq(cfs_rq);
+		resched_task(cfs_rq->rq->curr);
+	}
+}
+
+static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun)
+{
+	int i, idle = 1;
+	u64 delta;
+	const struct cpumask *span;
+
+	if (cfs_b->quota == RUNTIME_INF)
+		return 1;
+
+	/* reset group quota */
+	raw_spin_lock(&cfs_b->lock);
+	cfs_b->runtime = cfs_b->quota;
+	raw_spin_unlock(&cfs_b->lock);
+
+	span = sched_bw_period_mask();
+	for_each_cpu(i, span) {
+		struct rq *rq = cpu_rq(i);
+		struct cfs_rq *cfs_rq = cfs_bandwidth_cfs_rq(cfs_b, i);
+
+		if (!cfs_rq->nr_running)
+			idle = 0;
+
+		if (!cfs_rq_throttled(cfs_rq))
+			continue;
+
+		delta = tg_request_cfs_quota(cfs_rq->tg);
+
+		if (delta) {
+			raw_spin_lock(&rq->lock);
+			cfs_rq->quota_assigned += delta;
+
+			if (cfs_rq->quota_used < cfs_rq->quota_assigned)
+				unthrottle_cfs_rq(cfs_rq);
+			raw_spin_unlock(&rq->lock);
+		}
+	}
+
+	return idle;
+}
+
+#endif
+
 #ifdef CONFIG_SMP
 
 static void task_waking_fair(struct rq *rq, struct task_struct *p)
@@ -1155,7 +1333,7 @@ static void task_waking_fair(struct rq *rq, struct task_struct *p)
  * We still saw a performance dip, some tracing learned us that between
  * cgroup:/ and cgroup:/foo balancing the number of affine wakeups increased
  * significantly. Therefore try to bias the error in direction of failing
- * the affine wakeup.
+ * the affie wakeup.
  *
  */
 static long effective_load(struct task_group *tg, int cpu,
@@ -1936,9 +2114,10 @@ load_balance_fair(struct rq *this_rq, int this_cpu, struct rq *busiest,
 		u64 rem_load, moved_load;
 
 		/*
-		 * empty group
+		 * empty group or throttled cfs_rq
 		 */
-		if (!busiest_cfs_rq->task_weight)
+		if (!busiest_cfs_rq->task_weight ||
+				cfs_rq_throttled(busiest_cfs_rq))
 			continue;
 
 		rem_load = (u64)rem_load_move * busiest_weight;
@@ -3746,7 +3925,6 @@ static const struct sched_class fair_sched_class = {
 
 	.task_waking		= task_waking_fair,
 #endif
-
 	.set_curr_task          = set_curr_task_fair,
 	.task_tick		= task_tick_fair,
 	.task_fork		= task_fork_fair,
