@@ -87,7 +87,7 @@ unsigned int __read_mostly sysctl_sched_compat_yield;
 unsigned int sysctl_sched_wakeup_granularity = 1000000UL;
 unsigned int normalized_sysctl_sched_wakeup_granularity = 1000000UL;
 
-const_debug unsigned int sysctl_sched_migration_cost = ~0UL;
+const_debug unsigned int sysctl_sched_migration_cost = 500000UL;
 
 static const struct sched_class fair_sched_class;
 
