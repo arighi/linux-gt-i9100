@@ -35,9 +35,7 @@
 #include <linux/gpio.h>
 #include <linux/cpufreq.h>
 
-#define CPUMON 0
-
-#define CHECK_DELAY	(.5*HZ)
+#define CHECK_DELAY	(HZ >> 1)
 #define TRANS_LOAD_L	20
 #define TRANS_LOAD_H	(TRANS_LOAD_L*3)
 
@@ -68,6 +66,14 @@ static DEFINE_PER_CPU(struct cpu_time_info, hotplug_cpu_time);
 /* mutex can be used since hotplug_timer does not run in
    timer(softirq) context but in process context */
 static DEFINE_MUTEX(hotplug_lock);
+
+void fire_hotplug_cpu(void)
+{
+	if (hotpluging_rate)
+		return;
+	hotpluging_rate = CHECK_DELAY;
+	queue_delayed_work_on(0, hotplug_wq, &hotplug_work, hotpluging_rate);
+}
 
 static void hotplug_timer(struct work_struct *work)
 {
@@ -112,25 +118,20 @@ static void hotplug_timer(struct work_struct *work)
 	    (cpu_online(1) == 1)) {
 		printk("cpu1 turning off!\n");
 		cpu_down(1);
-#if CPUMON
-		printk(KERN_ERR "CPUMON D %d\n", avg_load);
-#endif
 		printk("cpu1 off end!\n");
-		hotpluging_rate = CHECK_DELAY;
+		hotpluging_rate = 0;
 	} else if (((avg_load > trans_load_h) && (cur_freq > 200 * 1000)) &&
 		   (cpu_online(1) == 0)) {
 		printk("cpu1 turning on!\n");
 		cpu_up(1);
-#if CPUMON
-		printk(KERN_ERR "CPUMON U %d\n", avg_load);
-#endif
 		printk("cpu1 on end!\n");
 		hotpluging_rate = CHECK_DELAY * 4;
 	}
- no_hotplug:
 
-	queue_delayed_work_on(0, hotplug_wq, &hotplug_work, hotpluging_rate);
-
+no_hotplug:
+	if (hotpluging_rate)
+		queue_delayed_work_on(0, hotplug_wq, &hotplug_work,
+					hotpluging_rate);
 	mutex_unlock(&hotplug_lock);
 }
 
