@@ -67,14 +67,6 @@ static DEFINE_PER_CPU(struct cpu_time_info, hotplug_cpu_time);
    timer(softirq) context but in process context */
 static DEFINE_MUTEX(hotplug_lock);
 
-void fire_hotplug_cpu(void)
-{
-	if (hotpluging_rate)
-		return;
-	hotpluging_rate = CHECK_DELAY;
-	queue_delayed_work_on(0, hotplug_wq, &hotplug_work, hotpluging_rate);
-}
-
 static void hotplug_timer(struct work_struct *work)
 {
 	unsigned int i, avg_load = 0, load = 0;
@@ -82,6 +74,8 @@ static void hotplug_timer(struct work_struct *work)
 
 	mutex_lock(&hotplug_lock);
 
+	if (!hotpluging_rate)
+		goto out;
 	if (user_lock == 1)
 		goto no_hotplug;
 
@@ -119,7 +113,7 @@ static void hotplug_timer(struct work_struct *work)
 		printk("cpu1 turning off!\n");
 		cpu_down(1);
 		printk("cpu1 off end!\n");
-		hotpluging_rate = 0;
+		hotpluging_rate = CHECK_DELAY;
 	} else if (((avg_load > trans_load_h) && (cur_freq > 200 * 1000)) &&
 		   (cpu_online(1) == 0)) {
 		printk("cpu1 turning on!\n");
@@ -129,9 +123,8 @@ static void hotplug_timer(struct work_struct *work)
 	}
 
 no_hotplug:
-	if (hotpluging_rate)
-		queue_delayed_work_on(0, hotplug_wq, &hotplug_work,
-					hotpluging_rate);
+	queue_delayed_work_on(0, hotplug_wq, &hotplug_work, hotpluging_rate);
+out:
 	mutex_unlock(&hotplug_lock);
 }
 
