@@ -3841,15 +3841,8 @@ need_resched_nonpreemptible:
 
 	pre_schedule(rq, prev);
 
-	trace_sched_load(cpu, rq->nr_running, rq->cpu_load[0]);
-
-	if (unlikely(!rq->nr_running)) {
+	if (unlikely(!rq->nr_running))
 		idle_balance(cpu, rq);
-	} else if (rq->nr_running >= 2 && rq->cpu_load[0] >= 8192) {
-		extern void fire_hotplug_cpu(void);
-
-		fire_hotplug_cpu();
-	}
 
 	put_prev_task(rq, prev);
 	next = pick_next_task(rq);
