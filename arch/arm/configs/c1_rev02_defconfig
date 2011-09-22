@@ -1,7 +1,7 @@
 #
 # Automatically generated make config: don't edit
 # Linux kernel version: 2.6.35.7
-# Thu Sep 22 14:51:13 2011
+# Thu Sep 22 14:53:03 2011
 #
 CONFIG_ARM=y
 CONFIG_HAVE_PWM=y
@@ -360,7 +360,7 @@ CONFIG_S5PV310_SETUP_USB_PHY=y
 CONFIG_S5PV310_PM=y
 CONFIG_SAMSUNG_IRQ_GPIO=y
 CONFIG_S5PV310_SETUP_TVOUT=y
-# CONFIG_DEV_THERMAL is not set
+CONFIG_DEV_THERMAL=y
 # CONFIG_MACH_SMDKC210 is not set
 # CONFIG_MACH_SMDKV310 is not set
 CONFIG_MACH_C1=y
