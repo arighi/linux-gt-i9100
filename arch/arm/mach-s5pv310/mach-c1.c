@@ -42,6 +42,7 @@
 #ifdef CONFIG_ANDROID_PMEM
 #include <linux/android_pmem.h>
 #endif
+#include <linux/bootmem.h>
 
 #include <asm/pmu.h>
 #include <asm/mach/arch.h>
@@ -5509,6 +5510,19 @@ static struct platform_device watchdog_reset_device = {
 };
 #endif
 
+static struct resource ram_console_resource[] = {
+	{ .flags = IORESOURCE_MEM, }
+};
+
+#ifdef CONFIG_ANDROID_RAM_CONSOLE
+static struct platform_device ram_console_device = {
+	.name = "ram_console",
+	.id = -1,
+	.num_resources = ARRAY_SIZE(ram_console_resource),
+	.resource = ram_console_resource,
+};
+#endif
+
 static struct platform_device *smdkc210_devices[] __initdata = {
 #ifdef CONFIG_S5PV310_WATCHDOG_RESET
 	&watchdog_reset_device,
@@ -5752,6 +5766,9 @@ static struct platform_device *smdkc210_devices[] __initdata = {
 	&s3c_device_cmc732,
 #endif
 
+#ifdef CONFIG_ANDROID_RAM_CONSOLE
+	&ram_console_device,
+#endif
 };
 
 #ifdef CONFIG_VIDEO_TVOUT
@@ -5789,6 +5806,26 @@ static void __init sromc_setup(void)
 static void __init s5pv310_reserve(void);
 #endif
 
+#if defined(CONFIG_ANDROID_RAM_CONSOLE)
+#define RAM_CONSOLE_MEM_START	(0x5e900000)
+
+static void __init s5pv310_reserve_ram_console(void)
+{
+	if (reserve_bootmem(RAM_CONSOLE_MEM_START,
+			(1 << CONFIG_LOG_BUF_SHIFT), BOOTMEM_EXCLUSIVE))
+		return;
+	ram_console_resource[0].start = RAM_CONSOLE_MEM_START;
+	ram_console_resource[0].end = ram_console_resource[0].start +
+					(1 << CONFIG_LOG_BUF_SHIFT) - 1;
+	pr_info("%s ram_console memory start -> %#zx, end -> %#zx\n",
+			__func__,
+			ram_console_resource[0].start,
+			ram_console_resource[0].end);
+}
+#else
+static inline void s5pv310_reserve_ram_console(void) { }
+#endif
+
 static void __init smdkc210_map_io(void)
 {
 	s5p_init_io(NULL, 0, S5P_VA_CHIPID);
@@ -5804,6 +5841,8 @@ static void __init smdkc210_map_io(void)
 #elif defined(CONFIG_S5P_MEM_BOOTMEM)
 	s5p_reserve_bootmem();
 #endif
+	s5pv310_reserve_ram_console();
+
 	sec_getlog_supply_meminfo(meminfo.bank[0].size, meminfo.bank[0].start,
 				  meminfo.bank[1].size, meminfo.bank[1].start);
 
