@@ -16,10 +16,13 @@
 #include <linux/gpio.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/notifier.h>
+#include <linux/percpu.h>
 
 #include <asm/proc-fns.h>
 #include <asm/cacheflush.h>
 #include <asm/hardware/cache-l2x0.h>
+#include <asm/idle.h>
 
 #include <plat/pm.h>
 #include <plat/cpu.h>
@@ -34,6 +37,30 @@
 #include <plat/devs.h>
 
 #include <mach/ext-gic.h>
+
+static ATOMIC_NOTIFIER_HEAD(idle_notifier);
+
+void idle_notifier_register(struct notifier_block *n)
+{
+	atomic_notifier_chain_register(&idle_notifier, n);
+}
+EXPORT_SYMBOL_GPL(idle_notifier_register);
+
+void idle_notifier_unregister(struct notifier_block *n)
+{
+	atomic_notifier_chain_unregister(&idle_notifier, n);
+}
+EXPORT_SYMBOL_GPL(idle_notifier_unregister);
+
+static void enter_idle(void)
+{
+	atomic_notifier_call_chain(&idle_notifier, IDLE_START, NULL);
+}
+
+static void exit_idle(void)
+{
+	atomic_notifier_call_chain(&idle_notifier, IDLE_END, NULL);
+}
 
 /* enable AFTR/LPA feature */
 static enum { ENABLE_IDLE = 0, ENABLE_AFTR = 1, ENABLE_LPA = 2 } enable_mask =
@@ -1292,6 +1319,7 @@ static int s5pv310_enter_lowpower(struct cpuidle_device *dev,
 				  struct cpuidle_state *state)
 {
 	struct cpuidle_state *new_state = state;
+	int ret;
 
 	/* This mode only can be entered when Core1 is offline */
 	if (cpu_online(1)) {
@@ -1300,17 +1328,20 @@ static int s5pv310_enter_lowpower(struct cpuidle_device *dev,
 	}
 	dev->last_state = new_state;
 
+	enter_idle();
 	if (new_state == &dev->states[0])
-		return s5pv310_enter_idle(dev, new_state);
-
-	if (s5pv310_check_operation())
-		return (enable_mask & ENABLE_AFTR)
+		ret = s5pv310_enter_idle(dev, new_state);
+	else if (s5pv310_check_operation())
+		ret = (enable_mask & ENABLE_AFTR)
 			? s5pv310_enter_core0_aftr(dev, new_state)
 			: s5pv310_enter_idle(dev, new_state);
+	else
+		ret = (enable_mask & ENABLE_LPA)
+			? s5pv310_enter_core0_lpa(dev, new_state)
+			: s5pv310_enter_idle(dev, new_state);
+	exit_idle();
 
-	return (enable_mask & ENABLE_LPA)
-		? s5pv310_enter_core0_lpa(dev, new_state)
-		: s5pv310_enter_idle(dev, new_state);
+	return ret;
 }
 
 static int s5pv310_init_cpuidle(void)
