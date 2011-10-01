@@ -1998,6 +1998,12 @@ int cpufreq_unregister_driver(struct cpufreq_driver *driver)
 }
 EXPORT_SYMBOL_GPL(cpufreq_unregister_driver);
 
+static int cpufreq_scaling_disabled;
+
+module_param(cpufreq_scaling_disabled, uint, 0644);
+MODULE_PARM_DESC(debug, "CPUfreq: "
+	"disable frequency range regulation based on screen on/off events");
+
 static unsigned int
 evaluate_cpu_freq(struct cpufreq_policy *policy, unsigned int base)
 {
@@ -2017,6 +2023,8 @@ static void powersave_early_suspend(struct early_suspend *handler)
 {
 	int cpu;
 
+	if (cpufreq_scaling_disabled)
+		return;
 	for_each_online_cpu(cpu) {
 		struct cpufreq_policy *cpu_policy, new_policy;
 
@@ -2043,6 +2051,8 @@ static void powersave_late_resume(struct early_suspend *handler)
 {
 	int cpu;
 
+	if (cpufreq_scaling_disabled)
+		return;
 	for_each_online_cpu(cpu) {
 		struct cpufreq_policy *cpu_policy, new_policy;
 
