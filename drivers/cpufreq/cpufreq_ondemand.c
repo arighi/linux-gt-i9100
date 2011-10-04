@@ -138,12 +138,14 @@ static struct dbs_tuners {
 	unsigned int powersave_bias;
 	unsigned int io_is_busy;
 	unsigned int deep_sleep;
+	unsigned int fast_start;
 } dbs_tuners_ins = {
 	.up_threshold = DEF_FREQUENCY_UP_THRESHOLD,
 	.down_differential = DEF_FREQUENCY_DOWN_DIFFERENTIAL,
 	.ignore_nice = 0,
 	.powersave_bias = 0,
 	.deep_sleep = 0,
+	.fast_start = 0,
 };
 
 static inline cputime64_t get_cpu_idle_time_jiffy(unsigned int cpu,
@@ -288,6 +290,7 @@ static ssize_t show_##file_name						\
 show_one(sampling_rate, sampling_rate);
 show_one(io_is_busy, io_is_busy);
 show_one(deep_sleep, deep_sleep);
+show_one(fast_start, fast_start);
 show_one(up_threshold, up_threshold);
 show_one(ignore_nice_load, ignore_nice);
 show_one(powersave_bias, powersave_bias);
@@ -363,6 +366,23 @@ static ssize_t store_deep_sleep(struct kobject *a, struct attribute *b,
 
 	mutex_lock(&dbs_mutex);
 	dbs_tuners_ins.deep_sleep = !!input;
+	mutex_unlock(&dbs_mutex);
+
+	return count;
+}
+
+static ssize_t store_fast_start(struct kobject *a, struct attribute *b,
+				   const char *buf, size_t count)
+{
+	unsigned int input;
+	int ret;
+
+	ret = sscanf(buf, "%u", &input);
+	if (ret != 1)
+		return -EINVAL;
+
+	mutex_lock(&dbs_mutex);
+	dbs_tuners_ins.fast_start = !!input;
 	mutex_unlock(&dbs_mutex);
 
 	return count;
@@ -448,6 +468,7 @@ static ssize_t store_powersave_bias(struct kobject *a, struct attribute *b,
 define_one_global_rw(sampling_rate);
 define_one_global_rw(io_is_busy);
 define_one_global_rw(deep_sleep);
+define_one_global_rw(fast_start);
 define_one_global_rw(up_threshold);
 define_one_global_rw(ignore_nice_load);
 define_one_global_rw(powersave_bias);
@@ -461,6 +482,7 @@ static struct attribute *dbs_attributes[] = {
 	&powersave_bias.attr,
 	&io_is_busy.attr,
 	&deep_sleep.attr,
+	&fast_start.attr,
 	NULL
 };
 
@@ -568,6 +590,21 @@ static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
 		if (dbs_tuners_ins.deep_sleep) {
 			if (delta > 4 * sampling_delta)
 				continue;
+		}
+
+		/*
+		 * Fast start detection.
+		 *
+		 * If in the last 4 samples the cpu did not enter in low-power
+		 * idle state, probably the cpu is busy; try to jump to the
+		 * maximum speed.
+		 */
+		if (dbs_tuners_ins.fast_start) {
+			if (delta && time_is_before_jiffies(end +
+							4 * sampling_delta)) {
+				max_load_freq = UINT_MAX;
+				break;
+			}
 		}
 
 		cur_idle_time = get_cpu_idle_time(j, &cur_wall_time);
