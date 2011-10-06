@@ -17,6 +17,10 @@
 #include <linux/backing-dev.h>
 #include "internal.h"
 
+static int fsync_disabled;
+module_param(fsync_disabled, int, 0600);
+MODULE_PARM_DESC(delay, "Change fsync() to work as a no-op: this is DANGEROUS");
+
 #define VALID_FLAGS (SYNC_FILE_RANGE_WAIT_BEFORE|SYNC_FILE_RANGE_WRITE| \
 			SYNC_FILE_RANGE_WAIT_AFTER)
 
@@ -128,12 +132,6 @@ void emergency_sync(void)
 	}
 }
 
-#ifdef CONFIG_FILE_SYNC_DISABLE
-static inline int do_fsync(unsigned int fd, int datasync)
-{
-	return 0;
-}
-#else /* !CONFIG_FILE_SYNC_DISABLE */
 /*
  * Generic function to fsync a file.
  */
@@ -142,6 +140,9 @@ int file_fsync(struct file *filp, int datasync)
 	struct inode *inode = filp->f_mapping->host;
 	struct super_block * sb;
 	int ret, err;
+
+	if (unlikely(fsync_disabled))
+		return 0;
 
 	/* sync the inode to buffers */
 	ret = write_inode_now(inode, 0);
@@ -175,6 +176,9 @@ int vfs_fsync_range(struct file *file, loff_t start, loff_t end, int datasync)
 	struct address_space *mapping = file->f_mapping;
 	int err, ret;
 
+	if (unlikely(fsync_disabled))
+		return 0;
+
 	if (!file->f_op || !file->f_op->fsync) {
 		ret = -EINVAL;
 		goto out;
@@ -202,6 +206,9 @@ static int do_fsync(unsigned int fd, int datasync)
 	struct file *file;
 	int ret = -EBADF;
 
+	if (unlikely(fsync_disabled))
+		return 0;
+
 	file = fget(fd);
 	if (file) {
 		ret = vfs_fsync(file, datasync);
@@ -209,7 +216,6 @@ static int do_fsync(unsigned int fd, int datasync)
 	}
 	return ret;
 }
-#endif /* CONFIG_FILE_SYNC_DISABLE */
 
 /**
  * vfs_fsync - perform a fsync or fdatasync on a file
@@ -252,13 +258,6 @@ int generic_write_sync(struct file *file, loff_t pos, loff_t count)
 }
 EXPORT_SYMBOL(generic_write_sync);
 
-#ifdef CONFIG_FILE_SYNC_DISABLE
-SYSCALL_DEFINE(sync_file_range)(int fd, loff_t offset, loff_t nbytes,
-				unsigned int flags)
-{
-	return 0;
-}
-#else /* !CONFIG_FILE_SYNC_DISABLE */
 /*
  * sys_sync_file_range() permits finely controlled syncing over a segment of
  * a file in the range offset .. (offset+nbytes-1) inclusive.  If nbytes is
@@ -315,6 +314,9 @@ SYSCALL_DEFINE(sync_file_range)(int fd, loff_t offset, loff_t nbytes,
 	loff_t endbyte;			/* inclusive */
 	int fput_needed;
 	umode_t i_mode;
+
+	if (unlikely(fsync_disabled))
+		return 0;
 
 	ret = -EINVAL;
 	if (flags & ~VALID_FLAGS)
@@ -389,7 +391,6 @@ out_put:
 out:
 	return ret;
 }
-#endif /* CONFIG_FILE_SYNC_DISABLE */
 
 #ifdef CONFIG_HAVE_SYSCALL_WRAPPERS
 asmlinkage long SyS_sync_file_range(long fd, loff_t offset, loff_t nbytes,
