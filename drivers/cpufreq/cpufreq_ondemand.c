@@ -762,13 +762,7 @@ static void do_dbs_timer(struct work_struct *work)
 
 static inline void dbs_timer_init(struct cpu_dbs_info_s *dbs_info)
 {
-	/* We want all CPUs to do sampling nearly on same jiffy */
 	int delay = usecs_to_jiffies(dbs_tuners_ins.sampling_rate);
-#if 0
-	delay -= jiffies % delay;
-#else
-	delay = usecs_to_jiffies(40 * 1000000);
-#endif
 
 	dbs_info->sample_type = DBS_NORMAL_SAMPLE;
 	INIT_DELAYED_WORK_DEFERRABLE(&dbs_info->work, do_dbs_timer);
