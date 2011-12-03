@@ -2077,9 +2077,8 @@ static void powersave_late_resume(struct early_suspend *handler)
 			continue;
 		if (cpufreq_get_policy(&new_policy, cpu))
 			goto out;
-		new_policy.max = cpu_policy->cpuinfo.max_freq;
-		new_policy.min = evaluate_cpu_freq(cpu_policy,
-					cpu_policy->cpuinfo.max_freq >> 1);
+		new_policy.max = cpu_policy->user_policy.max;
+		new_policy.min = cpu_policy->user_policy.min;
 		printk(KERN_INFO
 			"%s: set cpu%d freq in the %u-%u KHz range\n",
 			__func__, cpu, new_policy.min, new_policy.max);
